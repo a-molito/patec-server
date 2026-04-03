@@ -4,6 +4,7 @@ import json
 import hashlib
 import logging
 from datetime import datetime
+from typing import Optional
 from fastapi import FastAPI, Request, Header, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
@@ -25,7 +26,7 @@ ELEVENLABS_WEBHOOK_SECRET = os.getenv("ELEVENLABS_WEBHOOK_SECRET", "")
 
 tickets = []
 
-# ── Rate limiter ──────────────────────────────────────────────────────────────────────────────
+# Rate limiter
 limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
 
 app = FastAPI(title="PATEC Telefonagent API")
@@ -33,7 +34,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
-# ── Security headers middleware ──────────────────────────────────────────────────────────────────────────────
+# Security headers middleware
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
@@ -48,16 +49,15 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 app.add_middleware(SecurityHeadersMiddleware)
 
 
-# ── API-key helper ──────────────────────────────────────────────────────────────────────────────
-def check_api_key(x_api_key: str) -> None:
-    """Raise 403 when the supplied API key does not match the server key."""
+# API-key helper - always returns 403 (never 422) for missing/wrong key
+def check_api_key(x_api_key: Optional[str]) -> None:
     if not PATEC_API_KEY:
         raise HTTPException(status_code=500, detail="PATEC_API_KEY not configured on server")
-    if not hmac.compare_digest(x_api_key, PATEC_API_KEY):
-        raise HTTPException(status_code=403, detail="Forbidden: invalid API key")
+    if not x_api_key or not hmac.compare_digest(x_api_key, PATEC_API_KEY):
+        raise HTTPException(status_code=403, detail="Forbidden: invalid or missing API key")
 
 
-# ── Public endpoints (no auth) ──────────────────────────────────────────────────────────────────────────────
+# Public endpoints (no auth)
 @app.get("/health")
 @limiter.limit("30/minute")
 async def health(request: Request):
@@ -70,10 +70,10 @@ async def root(request: Request):
     return {"message": "PATEC API laeuft", "version": "1.0"}
 
 
-# ── Protected tool endpoints ──────────────────────────────────────────────────────────────────────────────
+# Protected tool endpoints
 @app.post("/tools/save_ticket")
 @limiter.limit("30/minute")
-async def save_ticket(request: Request, x_api_key: str = Header(...)):
+async def save_ticket(request: Request, x_api_key: Optional[str] = Header(None)):
     check_api_key(x_api_key)
     data = await request.json()
     ticket = {"id": len(tickets) + 1, "timestamp": datetime.now().isoformat(), **data}
@@ -83,7 +83,7 @@ async def save_ticket(request: Request, x_api_key: str = Header(...)):
 
 @app.post("/tools/send_telegram")
 @limiter.limit("30/minute")
-async def send_telegram(request: Request, x_api_key: str = Header(...)):
+async def send_telegram(request: Request, x_api_key: Optional[str] = Header(None)):
     check_api_key(x_api_key)
     # Security: always send to the server-configured TELEGRAM_CHAT_ID.
     # Any chat_id supplied by the agent in the request body is intentionally ignored.
@@ -101,7 +101,7 @@ async def send_telegram(request: Request, x_api_key: str = Header(...)):
 
 @app.post("/tools/check_calendar")
 @limiter.limit("30/minute")
-async def check_calendar(request: Request, x_api_key: str = Header(...)):
+async def check_calendar(request: Request, x_api_key: Optional[str] = Header(None)):
     check_api_key(x_api_key)
     from datetime import date, timedelta
     slots = []
@@ -118,13 +118,12 @@ async def check_calendar(request: Request, x_api_key: str = Header(...)):
     return {"free_slots": slots[:6]}
 
 
-# ── Webhook (HMAC-signed by ElevenLabs, no API-key) ──────────────────────────────────────────────────────────────────────────────
+# Webhook (HMAC-signed by ElevenLabs, no API-key)
 @app.post("/webhook/post-call")
 @limiter.limit("30/minute")
 async def post_call_webhook(request: Request):
     body = await request.body()
 
-    # Verify ElevenLabs HMAC-SHA256 signature when secret is configured
     if ELEVENLABS_WEBHOOK_SECRET:
         sig_header = request.headers.get("ElevenLabs-Signature", "")
         if not sig_header:
@@ -152,7 +151,7 @@ async def post_call_webhook(request: Request):
 
 @app.get("/tickets")
 @limiter.limit("30/minute")
-async def get_tickets(request: Request, x_api_key: str = Header(...)):
+async def get_tickets(request: Request, x_api_key: Optional[str] = Header(None)):
     check_api_key(x_api_key)
     return tickets
 
