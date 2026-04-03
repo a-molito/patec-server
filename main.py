@@ -8,7 +8,7 @@ import logging
 import asyncio
 from datetime import datetime
 from typing import Optional
-
+from urllib.parse import quote
 from fastapi import FastAPI, Request, Header, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
@@ -21,12 +21,12 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("patec")
 
-TELEGRAM_BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID", "")
-ELEVENLABS_AGENT_ID    = os.getenv("ELEVENLABS_AGENT_ID", "agent_3901kn83d76tf72tvg450k0fb8ek")
-PATEC_API_KEY          = os.getenv("PATEC_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "agent_3901kn83d76tf72tvg450k0fb8ek")
+PATEC_API_KEY       = os.getenv("PATEC_API_KEY", "")
 ELEVENLABS_WEBHOOK_SECRET = os.getenv("ELEVENLABS_WEBHOOK_SECRET", "")
-ELEVENLABS_API_KEY     = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_API_KEY        = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_PHONE_NUMBER_ID = os.getenv("ELEVENLABS_PHONE_NUMBER_ID", "")
 
 # Airtable
@@ -46,12 +46,13 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
-        response.headers["X-Content-Type-Options"]  = "nosniff"
-        response.headers["X-Frame-Options"]         = "DENY"
-        response.headers["X-XSS-Protection"]        = "1; mode=block"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
         response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        response.headers["Referrer-Policy"]         = "strict-origin-when-cross-origin"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         return response
+
 
 app.add_middleware(SecurityHeadersMiddleware)
 
@@ -79,8 +80,9 @@ async def _send_telegram_message(text: str) -> Optional[int]:
 def _detect_priority(text: str) -> str:
     t = text.lower()
     high_kw = ["dringend", "notfall", "notruf", "kaputt", "defekt", "ausgefallen",
-                "kein wasser", "kein strom", "rohrbruch", "gefahr", "brand", "sofort", "leck", "gas"]
-    low_kw  = ["frage", "info", "information", "termin", "anfrage", "beratung", "angebot", "allgemein"]
+               "kein wasser", "kein strom", "rohrbruch", "gefahr", "brand", "sofort", "leck", "gas"]
+    low_kw  = ["frage", "info", "information", "termin", "anfrage",
+               "beratung", "angebot", "allgemein"]
     if any(kw in t for kw in high_kw):
         return "Hoch"
     if any(kw in t for kw in low_kw):
@@ -109,8 +111,8 @@ async def log_to_airtable(call_data: dict):
     datum_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     combined_text = f"{anliegen} {summary}"
-    prioritaet    = _detect_priority(combined_text)
-    rueckruf      = _detect_callback(combined_text)
+    prioritaet = _detect_priority(combined_text)
+    rueckruf   = _detect_callback(combined_text)
 
     fields = {
         "Anruf-ID":              anruf_id,
@@ -126,18 +128,20 @@ async def log_to_airtable(call_data: dict):
         "Notizen":               notizen,
     }
 
-    url = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
+    # URL-encode table name (handles emojis and spaces)
+    table_encoded = quote(AIRTABLE_TABLE_NAME, safe="")
+    url     = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table_encoded}"
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
 
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(url, headers=headers, json={"fields": fields})
-            if resp.status_code in (200, 201):
-                record_id = resp.json().get("id")
-                log.info(f"Airtable: Anruf {anruf_id} gespeichert -> {record_id}")
-                return record_id
-            log.error(f"Airtable Fehler {resp.status_code}: {resp.text}")
-            return None
+        if resp.status_code in (200, 201):
+            record_id = resp.json().get("id")
+            log.info(f"Airtable: Anruf {anruf_id} gespeichert -> {record_id}")
+            return record_id
+        log.error(f"Airtable Fehler {resp.status_code}: {resp.text}")
+        return None
     except Exception as e:
         log.error(f"Airtable Exception: {e}")
         return None
@@ -150,9 +154,9 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
         return {"success": False, "reason": "ELEVENLABS_PHONE_NUMBER_ID nicht konfiguriert"}
 
     payload = {
-        "agent_id":               ELEVENLABS_AGENT_ID,
-        "agent_phone_number_id":  ELEVENLABS_PHONE_NUMBER_ID,
-        "to_number":              phone,
+        "agent_id": ELEVENLABS_AGENT_ID,
+        "agent_phone_number_id": ELEVENLABS_PHONE_NUMBER_ID,
+        "to_number": phone,
         "conversation_initiation_client_data": {
             "dynamic_variables": {"owner_instruction": instruction}
         },
@@ -164,11 +168,13 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
             headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
             json=payload,
         )
-        if resp.status_code == 200:
-            return {"success": True, "data": resp.json()}
-        log.error(f"Outbound call failed {resp.status_code}: {resp.text}")
-        return {"success": False, "status_code": resp.status_code, "detail": resp.text}
+    if resp.status_code == 200:
+        return {"success": True, "data": resp.json()}
+    log.error(f"Outbound call failed {resp.status_code}: {resp.text}")
+    return {"success": False, "status_code": resp.status_code, "detail": resp.text}
 
+
+# ── Endpoints ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
 @limiter.limit("30/minute")
@@ -186,7 +192,7 @@ async def root(request: Request):
 @limiter.limit("30/minute")
 async def save_ticket(request: Request, x_api_key: Optional[str] = Header(None)):
     check_api_key(x_api_key)
-    data = await request.json()
+    data   = await request.json()
     ticket = {"id": len(tickets) + 1, "timestamp": datetime.now().isoformat(), **data}
     tickets.append(ticket)
     return {"success": True, "ticket_id": ticket["id"]}
@@ -198,12 +204,14 @@ async def send_telegram(request: Request, x_api_key: Optional[str] = Header(None
     check_api_key(x_api_key)
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return {"success": False, "reason": "nicht konfiguriert"}
-    data = await request.json()
+
+    data  = await request.json()
     na    = "Nicht angegeben"
-    name  = data.get("name") or na
+    name  = data.get("name")  or na
     phone = data.get("phone") or na
     issue = data.get("issue") or na
     now   = datetime.now().strftime("%d.%m.%Y %H:%M")
+
     text = (
         f"\U0001f4de *Neuer Anruf bei PATEC*\n"
         f"\u23f0 {now}\n\n"
@@ -252,24 +260,32 @@ async def post_call_webhook(request: Request):
             v0_sig    = parts["v0"]
         except (KeyError, ValueError):
             raise HTTPException(status_code=403, detail="Invalid ElevenLabs-Signature format")
+
         message  = f"{timestamp}.{body.decode()}"
         expected = hmac.new(
-            ELEVENLABS_WEBHOOK_SECRET.encode(), message.encode(), hashlib.sha256
+            ELEVENLABS_WEBHOOK_SECRET.encode(),
+            message.encode(),
+            hashlib.sha256
         ).hexdigest()
         if not hmac.compare_digest(expected, v0_sig):
             raise HTTPException(status_code=403, detail="Webhook signature mismatch")
 
-    data            = json.loads(body)
-    conversation_id = data.get("conversation_id", "unknown")
-    log.info(f"Post-Call: {conversation_id}")
+    data = json.loads(body)
 
-    now      = datetime.now().strftime("%d.%m.%Y %H:%M")
-    metadata = data.get("metadata", {})
-    duration = metadata.get("call_duration_secs") or data.get("call_duration_secs", 0)
-    analysis = data.get("analysis", {})
+    # ElevenLabs wraps the actual payload inside a "data" key
+    payload = data.get("data", data)
+
+    conversation_id   = payload.get("conversation_id", "unknown")
+    log.info(f"Post-Call webhook: conversation_id={conversation_id}")
+    log.info(f"Post-Call raw keys: {list(payload.keys())}")
+
+    metadata = payload.get("metadata", {})
+    duration = metadata.get("call_duration_secs") or payload.get("call_duration_secs", 0)
+
+    analysis          = payload.get("analysis", {})
     transcript_summary = analysis.get("transcript_summary") or analysis.get("summary", "")
 
-    transcript = data.get("transcript", [])
+    transcript = payload.get("transcript", [])
     if not transcript_summary and transcript:
         lines = [f"{m.get('role','?').capitalize()}: {m.get('message','')}" for m in transcript[:2]]
         if len(transcript) > 2:
@@ -277,20 +293,14 @@ async def post_call_webhook(request: Request):
             lines.append(f"{transcript[-1].get('role','?').capitalize()}: {transcript[-1].get('message','')}")
         transcript_summary = "\n".join(lines)
 
-    data_coll    = analysis.get("data_collection_results") or {}
-    caller_name  = (data_coll.get("name") or {}).get("value", "")
-    caller_phone = (data_coll.get("phone") or {}).get("value", "")
-    caller_issue = (data_coll.get("issue") or data_coll.get("anliegen") or {}).get("value", "")
+    data_coll   = analysis.get("data_collection_results") or {}
+    caller_name  = (data_coll.get("name")    or {}).get("value", "")
+    caller_phone = (data_coll.get("phone")   or {}).get("value", "")
+    caller_issue = (data_coll.get("issue")   or data_coll.get("anliegen") or {}).get("value", "")
 
-    text = (
-        f"\U0001f4cb *Gespraechsprotokoll PATEC*\n"
-        f"\u23f0 {now}\n"
-        f"\U0001f194 Gespraech: `{conversation_id}`\n"
-        f"\u23f1 Dauer: {duration}s\n\n"
-        f"\U0001f4dd *Zusammenfassung:*\n{transcript_summary or 'Keine Zusammenfassung verfuegbar'}"
-    )
-    await _send_telegram_message(text)
+    log.info(f"Post-Call data: name={caller_name!r}, phone={caller_phone!r}, issue={caller_issue!r}, duration={duration}")
 
+    # Log to Airtable (no second Telegram – agent already sent the first message during the call)
     asyncio.create_task(log_to_airtable({
         "conversation_id": conversation_id,
         "name":            caller_name,
@@ -328,8 +338,9 @@ async def telegram_webhook(request: Request):
 
     original_message_id = str(reply_to.get("message_id", ""))
     original_text       = reply_to.get("text", "")
-    customer            = telegram_context.get(original_message_id)
-    phone               = customer["phone"] if customer else None
+
+    customer = telegram_context.get(original_message_id)
+    phone    = customer["phone"] if customer else None
 
     if not phone or phone == "Nicht angegeben":
         match = re.search(r"Rueckrufnummer.*?:\s*(.+)", original_text)
@@ -341,7 +352,8 @@ async def telegram_webhook(request: Request):
         return {"ok": True}
 
     customer_name = (customer or {}).get("name", "Kunde")
-    result = await trigger_outbound_call(phone, instruction)
+    result        = await trigger_outbound_call(phone, instruction)
+
     if result["success"]:
         await _send_telegram_message(
             f"\u2705 Anruf zu *{customer_name}* ({phone}) wird gestartet.\n"
@@ -362,18 +374,17 @@ async def get_calls(request: Request, x_api_key: Optional[str] = Header(None)):
     if not AIRTABLE_API_KEY or not AIRTABLE_BASE_ID:
         raise HTTPException(status_code=503, detail="Airtable nicht konfiguriert")
 
+    table_encoded = quote(AIRTABLE_TABLE_NAME, safe="")
     url = (
-        f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{AIRTABLE_TABLE_NAME}"
+        f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table_encoded}"
         f"?sort[0][field]=Datum&sort[0][direction]=desc&maxRecords=50"
     )
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
-
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(url, headers=headers)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        data = resp.json()
-
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data    = resp.json()
     records = [{"id": r["id"], **r["fields"]} for r in data.get("records", [])]
     return {"total": len(records), "calls": records}
 
@@ -388,7 +399,7 @@ async def setup_telegram_webhook(request: Request, x_api_key: Optional[str] = He
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
             json={"url": webhook_url},
         )
-        data = resp.json()
+    data = resp.json()
     log.info(f"setWebhook: {data}")
     return {"webhook_url": webhook_url, "telegram_response": data}
 
