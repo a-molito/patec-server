@@ -111,8 +111,12 @@ async def log_to_airtable(call_data: dict):
     datum_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     combined_text = f"{anliegen} {summary}"
-    prioritaet = _detect_priority(combined_text)
-    rueckruf   = _detect_callback(combined_text)
+    # Use override values from ElevenLabs data collection if available
+    prioritaet = call_data.get("prioritaet_override") or _detect_priority(combined_text)
+    if call_data.get("rueckruf_override") is not None:
+        rueckruf = call_data["rueckruf_override"]
+    else:
+        rueckruf = _detect_callback(combined_text)
 
     fields = {
         "Anruf-ID":              anruf_id,
@@ -294,20 +298,31 @@ async def post_call_webhook(request: Request):
         transcript_summary = "\n".join(lines)
 
     data_coll   = analysis.get("data_collection_results") or {}
-    caller_name  = (data_coll.get("name")    or {}).get("value", "")
-    caller_phone = (data_coll.get("phone")   or {}).get("value", "")
-    caller_issue = (data_coll.get("issue")   or data_coll.get("anliegen") or {}).get("value", "")
+    caller_name  = (data_coll.get("customer_name")  or {}).get("value", "")
+    caller_phone = (data_coll.get("customer_phone") or {}).get("value", "")
+    caller_issue = (data_coll.get("issue_type")     or {}).get("value", "")
+    # Use urgency/callback from ElevenLabs data collection directly
+    urgency_str  = (data_coll.get("urgency")            or {}).get("value", "")
+    callback_str = (data_coll.get("callback_requested") or {}).get("value", "")
 
     log.info(f"Post-Call data: name={caller_name!r}, phone={caller_phone!r}, issue={caller_issue!r}, duration={duration}")
 
     # Log to Airtable (no second Telegram – agent already sent the first message during the call)
+    # Map urgency_str to Airtable priority value
+    prioritaet_override = {"high": "Hoch", "medium": "Mittel", "low": "Niedrig"}.get(
+        (urgency_str or "").lower(), None
+    )
+    rueckruf_override = (callback_str in (True, "yes", "true", "ja", "1")) if callback_str != "" else None
+
     asyncio.create_task(log_to_airtable({
-        "conversation_id": conversation_id,
-        "name":            caller_name,
-        "phone":           caller_phone,
-        "anliegen":        caller_issue,
-        "summary":         transcript_summary,
-        "duration_secs":   duration,
+        "conversation_id":     conversation_id,
+        "name":                caller_name,
+        "phone":               caller_phone,
+        "anliegen":            caller_issue,
+        "summary":             transcript_summary,
+        "duration_secs":       duration,
+        "prioritaet_override": prioritaet_override,
+        "rueckruf_override":   rueckruf_override,
     }))
 
     return {"status": "received"}
