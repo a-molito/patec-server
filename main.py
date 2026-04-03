@@ -28,6 +28,7 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_PHONE_NUMBER_ID = os.getenv("ELEVENLABS_PHONE_NUMBER_ID", "")
 
 tickets = []
+pending_call = {}  # stores last call data until post-call fires
 telegram_context: dict = {}
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
@@ -128,19 +129,12 @@ async def send_telegram(request: Request, x_api_key: Optional[str] = Header(None
     name = data.get("name") or na
     phone = data.get("phone") or na
     issue = data.get("issue") or na
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    text = (
-        f"📞 *Neuer Anruf bei PATEC*\n"
-        f"⏰ {now}\n\n"
-        f"👤 *Name:* {name}\n"
-        f"📱 *Rückrufnummer:* {phone}\n"
-        f"🔧 *Anliegen:* {issue}"
-    )
-    message_id = await _send_telegram_message(text)
-    if message_id:
-        telegram_context[str(message_id)] = {"name": name, "phone": phone, "issue": issue}
-        log.info(f"Stored context for message_id={message_id}: {name}, {phone}")
-    return {"success": message_id is not None}
+    # Store data -- Telegram message will be sent after call ends (post-call webhook)
+    pending_call["name"] = name
+    pending_call["phone"] = phone
+    pending_call["issue"] = issue
+    log.info(f"Pending call stored: {name} / {phone} / {issue}")
+    return {"success": True}
 
 
 @app.post("/tools/check_calendar")
@@ -198,12 +192,18 @@ async def post_call_webhook(request: Request):
             lines.append("…")
             lines.append(f"{transcript[-1].get('role','?').capitalize()}: {transcript[-1].get('message','')}")
         transcript_summary = "\n".join(lines)
+    na = "Nicht angegeben"
+    name = pending_call.get("name", na)
+    phone = pending_call.get("phone", na)
+    issue = pending_call.get("issue", na)
+    pending_call.clear()
     text = (
-        f"📋 *Gesprächsprotokoll PATEC*\n"
-        f"⏰ {now}\n"
-        f"🆔 Gespräch: `{conversation_id}`\n"
-        f"⏱ Dauer: {duration}s\n\n"
-        f"📝 *Zusammenfassung:*\n{transcript_summary or 'Keine Zusammenfassung verfügbar'}"
+        f"📞 *Neuer Anruf \u2013 PATEC*\n"
+        f"⏰ {now}  |  ⏱ {duration}s\n\n"
+        f"👤 *Name:* {name}\n"
+        f"📱 *Telefon:* {phone}\n"
+        f"🔧 *Anliegen:* {issue}\n\n"
+        f"📝 *Gesprächszusammenfassung:*\n{transcript_summary or 'Keine Zusammenfassung verfügbar'}"
     )
     await _send_telegram_message(text)
     return {"status": "received"}
