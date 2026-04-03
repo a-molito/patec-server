@@ -166,19 +166,27 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
         },
     }
     log.info(f"Outbound call to {phone}: {instruction!r}")
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(
-            "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
-            headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
-            json=payload,
-        )
-    if resp.status_code == 200:
-        return {"success": True, "data": resp.json()}
-    log.error(f"Outbound call failed {resp.status_code}: {resp.text}")
-    return {"success": False, "status_code": resp.status_code, "detail": resp.text}
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
+                headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+                json=payload,
+            )
+        log.info(f"Outbound call response: {resp.status_code} {resp.text[:200]}")
+        if resp.status_code in (200, 201, 202):
+            try:
+                return {"success": True, "data": resp.json()}
+            except Exception:
+                return {"success": True, "data": {}}
+        log.error(f"Outbound call failed {resp.status_code}: {resp.text}")
+        return {"success": False, "status_code": resp.status_code, "detail": resp.text}
+    except Exception as e:
+        log.error(f"Outbound call exception: {e}")
+        return {"success": False, "reason": str(e)}
 
 
-# ── Endpoints ──────────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 @limiter.limit("30/minute")
@@ -302,8 +310,8 @@ async def post_call_webhook(request: Request):
     caller_phone = (data_coll.get("customer_phone") or {}).get("value", "")
     caller_issue = (data_coll.get("issue_type")     or {}).get("value", "")
     # Use urgency/callback from ElevenLabs data collection directly
-    urgency_str  = (data_coll.get("urgency")            or {}).get("value", "")
-    callback_str = (data_coll.get("callback_requested") or {}).get("value", "")
+    urgency_str  = (data_coll.get("urgency")             or {}).get("value", "")
+    callback_str = (data_coll.get("callback_requested")  or {}).get("value", "")
 
     log.info(f"Post-Call data: name={caller_name!r}, phone={caller_phone!r}, issue={caller_issue!r}, duration={duration}")
 
@@ -345,6 +353,7 @@ async def telegram_webhook(request: Request):
 
     reply_to = message.get("reply_to_message")
     if not reply_to:
+        # Only process replies to bot messages
         return {"ok": True}
 
     instruction = message.get("text", "").strip()
@@ -353,30 +362,54 @@ async def telegram_webhook(request: Request):
 
     original_message_id = str(reply_to.get("message_id", ""))
     original_text       = reply_to.get("text", "")
+    log.info(f"Reply received: msg_id={original_message_id}, instruction={instruction!r}")
+    log.info(f"Original text: {original_text[:200]!r}")
 
+    # Try in-memory context first (available if server not redeployed since message was sent)
     customer = telegram_context.get(original_message_id)
     phone    = customer["phone"] if customer else None
+    log.info(f"Context lookup: customer={customer}, phone={phone!r}")
 
+    # Fallback: extract phone from the original message text via regex
+    # Telegram stores the plain text without Markdown asterisks
     if not phone or phone == "Nicht angegeben":
-        match = re.search(r"Rueckrufnummer.*?:\s*(.+)", original_text)
+        # Try to match "Rueckrufnummer: +49..." (Telegram strips * formatting markers)
+        match = re.search(r"Rueckrufnummer[^:\n]*:\s*\*?\s*(\+?[\d\s\-]+)", original_text)
+        if not match:
+            # Broader fallback
+            match = re.search(r"Rueckrufnummer.*?:\s*(.+)", original_text)
         if match:
-            phone = match.group(1).strip()
+            phone = match.group(1).strip().strip("*").strip()
+            log.info(f"Regex extracted phone: {phone!r}")
 
-    if not phone or phone == "Nicht angegeben":
-        await _send_telegram_message("Konnte Rueckrufnummer nicht ermitteln.")
+    if not phone or phone in ("Nicht angegeben", "", "Kein"):
+        log.warning(f"Could not determine phone. original_text={original_text!r}")
+        await _send_telegram_message(
+            "\u274c Konnte Rückrufnummer nicht ermitteln.\n"
+            "Bitte manuell in der Nachricht nachschauen und direkt anrufen."
+        )
         return {"ok": True}
 
     customer_name = (customer or {}).get("name", "Kunde")
-    result        = await trigger_outbound_call(phone, instruction)
+    log.info(f"Triggering outbound call to {phone!r} for {customer_name!r}")
+
+    # Acknowledge receipt immediately
+    await _send_telegram_message(
+        f"\U0001f4de Starte Anruf zu *{customer_name}* ({phone})\u2026\n"
+        f"\U0001f4cb Anweisung: _{instruction}_"
+    )
+
+    result = await trigger_outbound_call(phone, instruction)
 
     if result["success"]:
         await _send_telegram_message(
-            f"\u2705 Anruf zu *{customer_name}* ({phone}) wird gestartet.\n"
-            f"\U0001f4cb Nachricht: _{instruction}_"
+            f"\u2705 Anruf zu *{customer_name}* ({phone}) erfolgreich gestartet."
         )
     else:
         reason = result.get("reason") or result.get("detail", "Unbekannter Fehler")
-        await _send_telegram_message(f"\u274c Anruf zu {phone} fehlgeschlagen: {reason}")
+        await _send_telegram_message(
+            f"\u274c Anruf zu {phone} fehlgeschlagen.\nGrund: {reason}"
+        )
 
     return {"ok": True}
 
