@@ -151,11 +151,30 @@ async def log_to_airtable(call_data: dict):
         return None
 
 
+def normalize_phone_e164(phone: str, default_country: str = "+49") -> str:
+    """Normalize a phone number to E.164 format (e.g. 017680730506 → +4917680730506)."""
+    digits = re.sub(r"[^\d+]", "", phone.strip())
+    if digits.startswith("00"):
+        digits = "+" + digits[2:]
+    elif digits.startswith("+"):
+        pass  # already E.164
+    elif digits.startswith("0"):
+        digits = default_country + digits[1:]
+    else:
+        digits = default_country.lstrip("+") + digits
+        if not digits.startswith("+"):
+            digits = "+" + digits
+    return digits
+
+
 async def trigger_outbound_call(phone: str, instruction: str) -> dict:
     if not ELEVENLABS_API_KEY:
         return {"success": False, "reason": "ELEVENLABS_API_KEY nicht konfiguriert"}
     if not ELEVENLABS_PHONE_NUMBER_ID:
         return {"success": False, "reason": "ELEVENLABS_PHONE_NUMBER_ID nicht konfiguriert"}
+
+    phone = normalize_phone_e164(phone)
+    log.info(f"Normalized phone for outbound call: {phone!r}")
 
     payload = {
         "agent_id": ELEVENLABS_AGENT_ID,
@@ -176,7 +195,13 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
         log.info(f"Outbound call response: {resp.status_code} {resp.text[:200]}")
         if resp.status_code in (200, 201, 202):
             try:
-                return {"success": True, "data": resp.json()}
+                body = resp.json()
+                # ElevenLabs sometimes returns 200 with success=false
+                if body.get("success") is False:
+                    reason = body.get("message") or body.get("detail") or "Unbekannter Fehler"
+                    log.error(f"Outbound call rejected by ElevenLabs: {reason}")
+                    return {"success": False, "reason": reason}
+                return {"success": True, "data": body}
             except Exception:
                 return {"success": True, "data": {}}
         log.error(f"Outbound call failed {resp.status_code}: {resp.text}")
