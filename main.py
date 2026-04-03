@@ -57,6 +57,18 @@ def check_api_key(x_api_key: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Forbidden: invalid or missing API key")
 
 
+# Shared Telegram helper
+async def _send_telegram_message(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+        )
+    return resp.status_code == 200
+
+
 # Public endpoints (no auth)
 @app.get("/health")
 @limiter.limit("30/minute")
@@ -85,18 +97,23 @@ async def save_ticket(request: Request, x_api_key: Optional[str] = Header(None))
 @limiter.limit("30/minute")
 async def send_telegram(request: Request, x_api_key: Optional[str] = Header(None)):
     check_api_key(x_api_key)
-    # Security: always send to the server-configured TELEGRAM_CHAT_ID.
-    # Any chat_id supplied by the agent in the request body is intentionally ignored.
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return {"success": False, "reason": "nicht konfiguriert"}
+    data = await request.json()
+    na = "Nicht angegeben"
+    name = data.get("name") or na
+    phone = data.get("phone") or na
+    issue = data.get("issue") or na
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    text = f"Neuer Anruf PATEC - {now}"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
-        )
-    return {"success": resp.status_code == 200}
+    text = (
+        f"📞 *Neuer Anruf bei PATEC*\n"
+        f"⏰ {now}\n\n"
+        f"👤 *Name:* {name}\n"
+        f"📱 *Rückrufnummer:* {phone}\n"
+        f"🔧 *Anliegen:* {issue}"
+    )
+    success = await _send_telegram_message(text)
+    return {"success": success}
 
 
 @app.post("/tools/check_calendar")
@@ -145,7 +162,31 @@ async def post_call_webhook(request: Request):
             raise HTTPException(status_code=403, detail="Webhook signature mismatch")
 
     data = json.loads(body)
-    log.info(f"Post-Call: {data.get('conversation_id', 'unknown')}")
+    conversation_id = data.get("conversation_id", "unknown")
+    log.info(f"Post-Call: {conversation_id}")
+
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    metadata = data.get("metadata", {})
+    duration = metadata.get("call_duration_secs") or data.get("call_duration_secs", "?")
+
+    analysis = data.get("analysis", {})
+    transcript_summary = analysis.get("transcript_summary") or analysis.get("summary", "")
+    transcript = data.get("transcript", [])
+    if not transcript_summary and transcript:
+        lines = [f"{m.get('role','?').capitalize()}: {m.get('message','')}" for m in transcript[:2]]
+        if len(transcript) > 2:
+            lines.append("…")
+            lines.append(f"{transcript[-1].get('role','?').capitalize()}: {transcript[-1].get('message','')}")
+        transcript_summary = "\n".join(lines)
+
+    text = (
+        f"📋 *Gesprächsprotokoll PATEC*\n"
+        f"⏰ {now}\n"
+        f"🆔 Gespräch: `{conversation_id}`\n"
+        f"⏱ Dauer: {duration}s\n\n"
+        f"📝 *Zusammenfassung:*\n{transcript_summary or 'Keine Zusammenfassung verfügbar'}"
+    )
+    await _send_telegram_message(text)
     return {"status": "received"}
 
 
