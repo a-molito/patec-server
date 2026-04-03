@@ -1,4 +1,5 @@
 import os
+import re
 import hmac
 import json
 import hashlib
@@ -23,18 +24,18 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "agent_3901kn83d76tf72tvg450k0fb8ek")
 PATEC_API_KEY = os.getenv("PATEC_API_KEY", "")
 ELEVENLABS_WEBHOOK_SECRET = os.getenv("ELEVENLABS_WEBHOOK_SECRET", "")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_PHONE_NUMBER_ID = os.getenv("ELEVENLABS_PHONE_NUMBER_ID", "")
 
 tickets = []
+telegram_context: dict = {}
 
-# Rate limiter
 limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
-
 app = FastAPI(title="PATEC Telefonagent API")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
-# Security headers middleware
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
@@ -45,11 +46,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         return response
 
-
 app.add_middleware(SecurityHeadersMiddleware)
 
 
-# API-key helper - always returns 403 (never 422) for missing/wrong key
 def check_api_key(x_api_key: Optional[str]) -> None:
     if not PATEC_API_KEY:
         raise HTTPException(status_code=500, detail="PATEC_API_KEY not configured on server")
@@ -57,19 +56,45 @@ def check_api_key(x_api_key: Optional[str]) -> None:
         raise HTTPException(status_code=403, detail="Forbidden: invalid or missing API key")
 
 
-# Shared Telegram helper
-async def _send_telegram_message(text: str) -> bool:
+async def _send_telegram_message(text: str) -> Optional[int]:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False
+        return None
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
         )
-    return resp.status_code == 200
+    if resp.status_code == 200:
+        return resp.json().get("result", {}).get("message_id")
+    return None
 
 
-# Public endpoints (no auth)
+async def trigger_outbound_call(phone: str, instruction: str) -> dict:
+    if not ELEVENLABS_API_KEY:
+        return {"success": False, "reason": "ELEVENLABS_API_KEY nicht konfiguriert"}
+    if not ELEVENLABS_PHONE_NUMBER_ID:
+        return {"success": False, "reason": "ELEVENLABS_PHONE_NUMBER_ID nicht konfiguriert"}
+    payload = {
+        "agent_id": ELEVENLABS_AGENT_ID,
+        "agent_phone_number_id": ELEVENLABS_PHONE_NUMBER_ID,
+        "to_number": phone,
+        "conversation_initiation_client_data": {
+            "dynamic_variables": {"owner_instruction": instruction}
+        },
+    }
+    log.info(f"Outbound call to {phone}: {instruction!r}")
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            "https://api.elevenlabs.io/v1/convai/twilio/outbound-call",
+            headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
+            json=payload,
+        )
+    if resp.status_code == 200:
+        return {"success": True, "data": resp.json()}
+    log.error(f"Outbound call failed {resp.status_code}: {resp.text}")
+    return {"success": False, "status_code": resp.status_code, "detail": resp.text}
+
+
 @app.get("/health")
 @limiter.limit("30/minute")
 async def health(request: Request):
@@ -82,7 +107,6 @@ async def root(request: Request):
     return {"message": "PATEC API laeuft", "version": "1.0"}
 
 
-# Protected tool endpoints
 @app.post("/tools/save_ticket")
 @limiter.limit("30/minute")
 async def save_ticket(request: Request, x_api_key: Optional[str] = Header(None)):
@@ -112,8 +136,11 @@ async def send_telegram(request: Request, x_api_key: Optional[str] = Header(None
         f"📱 *Rückrufnummer:* {phone}\n"
         f"🔧 *Anliegen:* {issue}"
     )
-    success = await _send_telegram_message(text)
-    return {"success": success}
+    message_id = await _send_telegram_message(text)
+    if message_id:
+        telegram_context[str(message_id)] = {"name": name, "phone": phone, "issue": issue}
+        log.info(f"Stored context for message_id={message_id}: {name}, {phone}")
+    return {"success": message_id is not None}
 
 
 @app.post("/tools/check_calendar")
@@ -135,12 +162,10 @@ async def check_calendar(request: Request, x_api_key: Optional[str] = Header(Non
     return {"free_slots": slots[:6]}
 
 
-# Webhook (HMAC-signed by ElevenLabs, no API-key)
 @app.post("/webhook/post-call")
 @limiter.limit("30/minute")
 async def post_call_webhook(request: Request):
     body = await request.body()
-
     if ELEVENLABS_WEBHOOK_SECRET:
         sig_header = request.headers.get("ElevenLabs-Signature", "")
         if not sig_header:
@@ -151,12 +176,9 @@ async def post_call_webhook(request: Request):
             v0_sig = parts["v0"]
         except (KeyError, ValueError):
             raise HTTPException(status_code=403, detail="Invalid ElevenLabs-Signature format")
-
         message = f"{timestamp}.{body.decode()}"
         expected = hmac.new(
-            ELEVENLABS_WEBHOOK_SECRET.encode(),
-            message.encode(),
-            hashlib.sha256,
+            ELEVENLABS_WEBHOOK_SECRET.encode(), message.encode(), hashlib.sha256
         ).hexdigest()
         if not hmac.compare_digest(expected, v0_sig):
             raise HTTPException(status_code=403, detail="Webhook signature mismatch")
@@ -164,11 +186,9 @@ async def post_call_webhook(request: Request):
     data = json.loads(body)
     conversation_id = data.get("conversation_id", "unknown")
     log.info(f"Post-Call: {conversation_id}")
-
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
     metadata = data.get("metadata", {})
     duration = metadata.get("call_duration_secs") or data.get("call_duration_secs", "?")
-
     analysis = data.get("analysis", {})
     transcript_summary = analysis.get("transcript_summary") or analysis.get("summary", "")
     transcript = data.get("transcript", [])
@@ -178,7 +198,6 @@ async def post_call_webhook(request: Request):
             lines.append("…")
             lines.append(f"{transcript[-1].get('role','?').capitalize()}: {transcript[-1].get('message','')}")
         transcript_summary = "\n".join(lines)
-
     text = (
         f"📋 *Gesprächsprotokoll PATEC*\n"
         f"⏰ {now}\n"
@@ -188,6 +207,65 @@ async def post_call_webhook(request: Request):
     )
     await _send_telegram_message(text)
     return {"status": "received"}
+
+
+@app.post("/webhook/telegram")
+@limiter.limit("30/minute")
+async def telegram_webhook(request: Request):
+    update = await request.json()
+    log.info(f"Telegram update: {json.dumps(update)[:500]}")
+    message = update.get("message", {})
+    if not message:
+        return {"ok": True}
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
+        log.warning(f"Ignoring message from unexpected chat_id: {chat_id}")
+        return {"ok": True}
+    reply_to = message.get("reply_to_message")
+    if not reply_to:
+        return {"ok": True}
+    instruction = message.get("text", "").strip()
+    if not instruction:
+        return {"ok": True}
+    original_message_id = str(reply_to.get("message_id", ""))
+    original_text = reply_to.get("text", "")
+    customer = telegram_context.get(original_message_id)
+    phone = customer["phone"] if customer else None
+    if not phone or phone == "Nicht angegeben":
+        match = re.search(r"Rückrufnummer.*?:\s*(.+)", original_text)
+        if match:
+            phone = match.group(1).strip()
+    if not phone or phone == "Nicht angegeben":
+        await _send_telegram_message(
+            "⚠️ Konnte Rückrufnummer nicht ermitteln. Bitte Nummer manuell angeben."
+        )
+        return {"ok": True}
+    customer_name = (customer or {}).get("name", "Kunde")
+    result = await trigger_outbound_call(phone, instruction)
+    if result["success"]:
+        await _send_telegram_message(
+            f"✅ Anruf zu *{customer_name}* ({phone}) wird gestartet.\n"
+            f"📋 Nachricht: _{instruction}_"
+        )
+    else:
+        reason = result.get("reason") or result.get("detail", "Unbekannter Fehler")
+        await _send_telegram_message(f"❌ Anruf zu {phone} fehlgeschlagen: {reason}")
+    return {"ok": True}
+
+
+@app.get("/setup/telegram-webhook")
+@limiter.limit("5/minute")
+async def setup_telegram_webhook(request: Request, x_api_key: Optional[str] = Header(None)):
+    check_api_key(x_api_key)
+    webhook_url = "https://web-production-3812a.up.railway.app/webhook/telegram"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+            json={"url": webhook_url},
+        )
+    data = resp.json()
+    log.info(f"setWebhook: {data}")
+    return {"webhook_url": webhook_url, "telegram_response": data}
 
 
 @app.get("/tickets")
