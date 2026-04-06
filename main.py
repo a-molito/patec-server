@@ -231,7 +231,7 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
             "dynamic_variables": {"owner_instruction": instruction},
             "conversation_config_override": {
                 "agent": {
-                    "first_message": instruction
+                    "first_message": f"Guten Tag, hier ist der Telefonassistent von PATEC. Wir melden uns bezüglich Ihres Anliegens: {instruction[:120]}."
                 }
             }
         },
