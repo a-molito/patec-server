@@ -12,7 +12,7 @@ from urllib.parse import quote
 from fastapi import FastAPI, Request, Header, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
-from dotenv import load_dotenv
+from dotenv import load_doten
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -588,8 +588,8 @@ async def setup_telegram_webhook(request: Request, x_api_key: Optional[str] = He
 async def test_telegram(request: Request, x_api_key: Optional[str] = Header(None)):
     check_api_key(x_api_key)
     async with httpx.AsyncClient(timeout=10) as client:
-        bot_resp = await client.get(f"https://api.telegram.org/bot{TELEBRAM_BOT_TOKEN}/getMe")
-        webhook_resp = await client.get(f"https://api.telegram.org/bot{TELEBRAM_BOT_TOKEN}/getWebhookInfo")
+        bot_resp = await client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe")
+        webhook_resp = await client.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo")
     msg_id = await _send_telegram_message("🔔 PATEC Test-Nachricht — Telegram funktioniert! ✅")
     return {
         "token_configured": bool(TELEGRAM_BOT_TOKEN),
