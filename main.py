@@ -6,7 +6,7 @@ import json
 import hashlib
 import logging
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote
 from fastapi import FastAPI, Request, Header, HTTPException
@@ -22,23 +22,23 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("patec")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ELEVENLABS_AGENT_ID = os.getenv("ELEVENLABS_AGENT_ID", "agent_3901kn83d76tf72tvg450k0fb8ek")
-PATEC_API_KEY       = os.getenv("PATEC_API_KEY", "")
+PATEC_API_KEY = os.getenv("PATEC_API_KEY", "")
 ELEVENLABS_WEBHOOK_SECRET = os.getenv("ELEVENLABS_WEBHOOK_SECRET", "")
-ELEVENLABS_API_KEY        = os.getenv("ELEVENLABS_API_KEY", "")
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_PHONE_NUMBER_ID = os.getenv("ELEVENLABS_PHONE_NUMBER_ID", "")
 
-# Airtable
-AIRTABLE_API_KEY    = os.getenv("AIRTABLE_API_KEY", "")
-AIRTABLE_BASE_ID    = os.getenv("AIRTABLE_BASE_ID", "")
-AIRTABLE_TABLE_NAME = os.getenv("AIRTABLE_TABLE_NAME", "Anrufe")
+AIRTABLE_API_KEY = os.getenv("AIRTABLE_API_KEY", "")
+AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID", "")
+AIRTABLE_TABLE_CALLS = "📞 Anrufe"
+AIRTABLE_TABLE_CUSTOMERS = "👥 Kunden"
+AIRTABLE_TABLE_TICKETS = "🎫 Tickets"
 
-tickets: list = []
 telegram_context: dict = {}
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
-app = FastAPI(title="PATEC Telefonagent API")
+app = FastAPI(title="PATEC Telefonagent API v3")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -59,30 +59,31 @@ app.add_middleware(SecurityHeadersMiddleware)
 
 def check_api_key(x_api_key: Optional[str]) -> None:
     if not PATEC_API_KEY:
-        raise HTTPException(status_code=500, detail="PATEC_API_KEY not configured on server")
+        raise HTTPException(status_code=500, detail="PATEC_API_KEY not configured")
     if not x_api_key or not hmac.compare_digest(x_api_key, PATEC_API_KEY):
         raise HTTPException(status_code=403, detail="Forbidden: invalid or missing API key")
 
 
-async def _send_telegram_message(text: str) -> Optional[int]:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return None
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
-        )
-        if resp.status_code == 200:
-            return resp.json().get("result", {}).get("message_id")
-    return None
+def normalize_phone_e164(phone: str, default_country: str = "+49") -> str:
+    digits = re.sub(r"[^\d+]", "", phone.strip())
+    if digits.startswith("00"):
+        digits = "+" + digits[2:]
+    elif digits.startswith("+"):
+        pass
+    elif digits.startswith("0"):
+        digits = default_country + digits[1:]
+    else:
+        digits = default_country.lstrip("+") + digits
+    if not digits.startswith("+"):
+        digits = "+" + digits
+    return digits
 
 
 def _detect_priority(text: str) -> str:
     t = text.lower()
     high_kw = ["dringend", "notfall", "notruf", "kaputt", "defekt", "ausgefallen",
-               "kein wasser", "kein strom", "rohrbruch", "gefahr", "brand", "sofort", "leck", "gas"]
-    low_kw  = ["frage", "info", "information", "termin", "anfrage",
-               "beratung", "angebot", "allgemein"]
+                "kein wasser", "kein strom", "rohrbruch", "gefahr", "brand", "sofort", "gas", "spinnt"]
+    low_kw = ["frage", "info", "information", "termin", "anfrage", "beratung", "angebot", "allgemein"]
     if any(kw in t for kw in high_kw):
         return "Hoch"
     if any(kw in t for kw in low_kw):
@@ -90,81 +91,128 @@ def _detect_priority(text: str) -> str:
     return "Mittel"
 
 
-def _detect_callback(text: str) -> bool:
-    t = text.lower()
-    cb_kw = ["rueckruf", "zurueckrufen", "callback", "ruf mich", "bitte anrufen"]
-    return any(kw in t for kw in cb_kw)
+async def _send_telegram_message(text: str) -> Optional[int]:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram nicht konfiguriert: TOKEN=%s CHAT=%s", bool(TELEGRAM_BOT_TOKEN), bool(TELEGRAM_CHAT_ID))
+        return None
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+        )
+        log.info(f"Telegram sendMessage: {resp.status_code} {resp.text[:200]}")
+        if resp.status_code == 200:
+            return resp.json().get("result", {}).get("message_id")
+        return None
+
+
+def _airtable_headers() -> dict:
+    return {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
+
+
+def _airtable_url(table_name: str) -> str:
+    return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{quote(table_name, safe='')}"
+
+
+async def _airtable_search(table_name: str, formula: str, max_records: int = 10) -> list:
+    params = f"?filterByFormula={quote(formula, safe='')}&maxRecords={max_records}"
+    url = _airtable_url(table_name) + params
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, headers=_airtable_headers())
+            if resp.status_code == 200:
+                return resp.json().get("records", [])
+            log.error(f"Airtable search error {resp.status_code}: {resp.text[:300]}")
+    except Exception as e:
+        log.error(f"Airtable search exception: {e}")
+    return []
+
+
+async def _airtable_create(table_name: str, fields: dict) -> Optional[str]:
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(
+                _airtable_url(table_name),
+                headers=_airtable_headers(),
+                json={"fields": fields}
+            )
+            if resp.status_code in (200, 201):
+                return resp.json().get("id")
+            log.error(f"Airtable create error {resp.status_code}: {resp.text[:300]}")
+    except Exception as e:
+        log.error(f"Airtable create exception: {e}")
+    return None
+
+
+async def _airtable_update(table_name: str, record_id: str, fields: dict) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.patch(
+                f"{_airtable_url(table_name)}/{record_id}",
+                headers=_airtable_headers(),
+                json={"fields": fields}
+            )
+            return resp.status_code in (200, 201)
+    except Exception as e:
+        log.error(f"Airtable update exception: {e}")
+        return False
+
+
+async def upsert_customer(phone: str, name: str = None, update_call_count: bool = True) -> Optional[str]:
+    if not phone:
+        return None
+    norm_phone = normalize_phone_e164(phone)
+    formula = f"{{Telefon}}='{norm_phone}'"
+    records = await _airtable_search(AIRTABLE_TABLE_CUSTOMERS, formula, max_records=1)
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+    if records:
+        record = records[0]
+        record_id = record["id"]
+        current_count = record.get("fields", {}).get("Anruf-Anzahl", 0) or 0
+        update_fields = {"Letzter Anruf": now_iso}
+        if update_call_count:
+            update_fields["Anruf-Anzahl"] = current_count + 1
+        if name and not record.get("fields", {}).get("Name"):
+            update_fields["Name"] = name
+        await _airtable_update(AIRTABLE_TABLE_CUSTOMERS, record_id, update_fields)
+        return record_id
+    else:
+        fields = {
+            "Telefon": norm_phone,
+            "Erstanruf": now_iso,
+            "Letzter Anruf": now_iso,
+            "Anruf-Anzahl": 1 if update_call_count else 0,
+        }
+        if name:
+            fields["Name"] = name
+        return await _airtable_create(AIRTABLE_TABLE_CUSTOMERS, fields)
 
 
 async def log_to_airtable(call_data: dict):
     if not AIRTABLE_API_KEY or not AIRTABLE_BASE_ID:
-        log.warning("Airtable nicht konfiguriert")
         return None
-
-    anruf_id  = call_data.get("conversation_id") or str(uuid.uuid4())[:8].upper()
-    name      = call_data.get("name", "Unbekannt")
-    telefon   = call_data.get("phone", "")
-    anliegen  = call_data.get("anliegen") or call_data.get("issue", "")
-    summary   = call_data.get("summary", "")
-    duration  = call_data.get("duration_secs", 0)
-    notizen   = call_data.get("notizen", "")
-    datum_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
-
-    combined_text = f"{anliegen} {summary}"
-    # Use override values from ElevenLabs data collection if available
+    anruf_id = call_data.get("conversation_id") or str(uuid.uuid4())[:8].upper()
+    combined_text = f"{call_data.get('anliegen','')} {call_data.get('summary','')}"
     prioritaet = call_data.get("prioritaet_override") or _detect_priority(combined_text)
-    if call_data.get("rueckruf_override") is not None:
-        rueckruf = call_data["rueckruf_override"]
-    else:
-        rueckruf = _detect_callback(combined_text)
-
+    rueckruf = call_data.get("rueckruf_override")
+    if rueckruf is None:
+        rueckruf = any(kw in combined_text.lower() for kw in ["rueckruf", "zurueckrufen", "callback", "ruf mich"])
+    datum_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
     fields = {
-        "Anruf-ID":              anruf_id,
-        "Name":                  name,
-        "Telefon":               telefon,
-        "Anliegen":              anliegen,
-        "Datum":                 datum_iso,
-        "Dauer (Sek.)":          int(duration) if duration else 0,
-        "Zusammenfassung":       summary,
-        "Status":                "Neu",
-        "Prioritaet":            prioritaet,
+        "Anruf-ID": anruf_id,
+        "Name": call_data.get("name", "Unbekannt"),
+        "Telefon": call_data.get("phone", ""),
+        "Anliegen": call_data.get("anliegen", ""),
+        "Datum": datum_iso,
+        "Dauer (Sek.)": int(call_data.get("duration_secs", 0)),
+        "Zusammenfassung": call_data.get("summary", ""),
+        "Status": "Neu",
+        "Prioritaet": prioritaet,
         "Rueckruf erforderlich": rueckruf,
-        "Notizen":               notizen,
+        "Notizen": call_data.get("notizen", ""),
     }
-
-    # URL-encode table name (handles emojis and spaces)
-    table_encoded = quote(AIRTABLE_TABLE_NAME, safe="")
-    url     = f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table_encoded}"
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}", "Content-Type": "application/json"}
-
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(url, headers=headers, json={"fields": fields})
-        if resp.status_code in (200, 201):
-            record_id = resp.json().get("id")
-            log.info(f"Airtable: Anruf {anruf_id} gespeichert -> {record_id}")
-            return record_id
-        log.error(f"Airtable Fehler {resp.status_code}: {resp.text}")
-        return None
-    except Exception as e:
-        log.error(f"Airtable Exception: {e}")
-        return None
-
-
-def normalize_phone_e164(phone: str, default_country: str = "+49") -> str:
-    """Normalize a phone number to E.164 format (e.g. 017680730506 → +4917680730506)."""
-    digits = re.sub(r"[^\d+]", "", phone.strip())
-    if digits.startswith("00"):
-        digits = "+" + digits[2:]
-    elif digits.startswith("+"):
-        pass  # already E.164
-    elif digits.startswith("0"):
-        digits = default_country + digits[1:]
-    else:
-        digits = default_country.lstrip("+") + digits
-        if not digits.startswith("+"):
-            digits = "+" + digits
-    return digits
+    return await _airtable_create(AIRTABLE_TABLE_CALLS, fields)
 
 
 async def trigger_outbound_call(phone: str, instruction: str) -> dict:
@@ -172,10 +220,7 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
         return {"success": False, "reason": "ELEVENLABS_API_KEY nicht konfiguriert"}
     if not ELEVENLABS_PHONE_NUMBER_ID:
         return {"success": False, "reason": "ELEVENLABS_PHONE_NUMBER_ID nicht konfiguriert"}
-
     phone = normalize_phone_e164(phone)
-    log.info(f"Normalized phone for outbound call: {phone!r}")
-
     payload = {
         "agent_id": ELEVENLABS_AGENT_ID,
         "agent_phone_number_id": ELEVENLABS_PHONE_NUMBER_ID,
@@ -184,7 +229,6 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
             "dynamic_variables": {"owner_instruction": instruction}
         },
     }
-    log.info(f"Outbound call to {phone}: {instruction!r}")
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -192,75 +236,150 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
                 headers={"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"},
                 json=payload,
             )
-        log.info(f"Outbound call response: {resp.status_code} {resp.text[:200]}")
-        if resp.status_code in (200, 201, 202):
-            try:
-                body = resp.json()
-                # ElevenLabs sometimes returns 200 with success=false
-                if body.get("success") is False:
-                    reason = body.get("message") or body.get("detail") or "Unbekannter Fehler"
-                    log.error(f"Outbound call rejected by ElevenLabs: {reason}")
-                    return {"success": False, "reason": reason}
-                return {"success": True, "data": body}
-            except Exception:
-                return {"success": True, "data": {}}
-        log.error(f"Outbound call failed {resp.status_code}: {resp.text}")
-        return {"success": False, "status_code": resp.status_code, "detail": resp.text}
+            log.info(f"Outbound call {resp.status_code}: {resp.text[:200]}")
+            if resp.status_code in (200, 201, 202):
+                try:
+                    body = resp.json()
+                    if body.get("success") is False:
+                        return {"success": False, "reason": body.get("message", "Unbekannter Fehler")}
+                    return {"success": True, "data": body}
+                except Exception:
+                    return {"success": True, "data": {}}
+            return {"success": False, "status_code": resp.status_code, "detail": resp.text}
     except Exception as e:
-        log.error(f"Outbound call exception: {e}")
         return {"success": False, "reason": str(e)}
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
 
 @app.get("/health")
 @limiter.limit("30/minute")
 async def health(request: Request):
-    return {"status": "ok", "tickets": len(tickets)}
+    return {"status": "ok", "version": "3.0"}
 
 
 @app.get("/")
 @limiter.limit("30/minute")
 async def root(request: Request):
-    return {"message": "PATEC API laeuft", "version": "2.0"}
+    return {"message": "PATEC API laeuft", "version": "3.0"}
 
 
-@app.post("/tools/save_ticket")
+@app.post("/tools/lookup_customer")
 @limiter.limit("30/minute")
-async def save_ticket(request: Request, x_api_key: Optional[str] = Header(None)):
+async def lookup_customer(request: Request, x_api_key: Optional[str] = Header(None)):
+    """Sucht Kunden anhand der Telefonnummer. Gibt Kundeninfo + letzte Anrufe zurueck."""
     check_api_key(x_api_key)
-    data   = await request.json()
-    ticket = {"id": len(tickets) + 1, "timestamp": datetime.now().isoformat(), **data}
-    tickets.append(ticket)
-    return {"success": True, "ticket_id": ticket["id"]}
+    data = await request.json()
+    phone_raw = data.get("phone", "").strip()
+    if not phone_raw:
+        return {"found": False, "error": "Keine Telefonnummer angegeben"}
 
+    phone = normalize_phone_e164(phone_raw)
+    log.info(f"lookup_customer: {phone_raw!r} -> {phone!r}")
 
-@app.post("/tools/send_telegram")
-@limiter.limit("30/minute")
-async def send_telegram(request: Request, x_api_key: Optional[str] = Header(None)):
-    check_api_key(x_api_key)
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return {"success": False, "reason": "nicht konfiguriert"}
-
-    data  = await request.json()
-    na    = "Nicht angegeben"
-    name  = data.get("name")  or na
-    phone = data.get("phone") or na
-    issue = data.get("issue") or na
-    now   = datetime.now().strftime("%d.%m.%Y %H:%M")
-
-    text = (
-        f"\U0001f4de *Neuer Anruf bei PATEC*\n"
-        f"\u23f0 {now}\n\n"
-        f"\U0001f464 *Name:* {name}\n"
-        f"\U0001f4f1 *Rueckrufnummer:* {phone}\n"
-        f"\U0001f527 *Anliegen:* {issue}"
+    records = await _airtable_search(AIRTABLE_TABLE_CUSTOMERS, f"{{Telefon}}='{phone}'", max_records=1)
+    recent_calls_raw = await _airtable_search(
+        AIRTABLE_TABLE_CALLS,
+        f"{{Telefon}}='{phone}'",
+        max_records=5
     )
-    message_id = await _send_telegram_message(text)
-    if message_id:
-        telegram_context[str(message_id)] = {"name": name, "phone": phone, "issue": issue}
-        log.info(f"Stored context for message_id={message_id}: {name}, {phone}")
-    return {"success": message_id is not None}
+    recent_calls = []
+    for r in recent_calls_raw:
+        f = r.get("fields", {})
+        recent_calls.append({
+            "datum": f.get("Datum", ""),
+            "anliegen": f.get("Anliegen", ""),
+            "zusammenfassung": (f.get("Zusammenfassung") or "")[:200],
+        })
+
+    if records:
+        customer = records[0]
+        fields = customer.get("fields", {})
+        return {
+            "found": True,
+            "customer_id": customer["id"],
+            "name": fields.get("Name", ""),
+            "telefon": phone,
+            "hat_pv_anlage": fields.get("Hat PV-Anlage", False),
+            "anlage_info": fields.get("Anlage-Info", ""),
+            "anruf_anzahl": fields.get("Anruf-Anzahl", 0),
+            "notizen": fields.get("Notizen", ""),
+            "letzte_anrufe": recent_calls,
+        }
+    return {
+        "found": False,
+        "telefon": phone,
+        "letzte_anrufe": recent_calls,
+    }
+
+
+@app.post("/tools/create_ticket")
+@limiter.limit("30/minute")
+async def create_ticket(request: Request, x_api_key: Optional[str] = Header(None)):
+    """Erstellt ein Ticket in Airtable und sendet Telegram-Benachrichtigung."""
+    check_api_key(x_api_key)
+    data = await request.json()
+
+    titel = data.get("titel", "Neues Anliegen")
+    beschreibung = data.get("beschreibung", "")
+    kategorie = data.get("kategorie", "Sonstiges")
+    prioritaet = data.get("prioritaet") or _detect_priority(f"{titel} {beschreibung}")
+    kunden_name = data.get("kunden_name", "Unbekannt")
+    kunden_telefon = data.get("kunden_telefon", "")
+    gewuenschter_termin = data.get("gewuenschter_termin", "")
+    anruf_id = data.get("anruf_id", "")
+    zustaendig = data.get("zustaendig", "Aki Paleopanis")
+
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    norm_phone = normalize_phone_e164(kunden_telefon) if kunden_telefon else ""
+
+    ticket_fields = {
+        "Titel": titel,
+        "Beschreibung": beschreibung,
+        "Status": "Neu",
+        "Priorität": prioritaet,
+        "Kategorie": kategorie,
+        "Kunden-Name": kunden_name,
+        "Kunden-Telefon": norm_phone,
+        "Erstellt am": now_iso,
+        "Zuletzt aktualisiert": now_iso,
+        "Zuständig": zustaendig,
+    }
+    if gewuenschter_termin:
+        ticket_fields["Gewünschter Termin"] = gewuenschter_termin
+    if anruf_id:
+        ticket_fields["Anruf-ID"] = anruf_id
+
+    ticket_id = await _airtable_create(AIRTABLE_TABLE_TICKETS, ticket_fields)
+    if norm_phone:
+        asyncio.create_task(upsert_customer(norm_phone, kunden_name, update_call_count=False))
+
+    prio_emoji = {"Hoch": "🔴", "Mittel": "🟡", "Niedrig": "🟢"}.get(prioritaet, "⚪")
+    kat_emoji = {
+        "PV-Anlage": "☀️", "Elektrotechnik": "⚡", "SHK": "🔧",
+        "Termin": "📅", "Beratung / Angebot": "💬", "Chef-Rückruf": "👤", "Sonstiges": "📋"
+    }.get(kategorie, "📋")
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    termin_line = f"\n📅 *Gewünschter Termin:* {gewuenschter_termin}" if gewuenschter_termin else ""
+
+    tg_text = (
+        f"{kat_emoji} *Neues Ticket: {titel}*\n"
+        f"⏰ {now_str}\n\n"
+        f"👤 *Name:* {kunden_name}\n"
+        f"📱 *Telefon:* {norm_phone or 'nicht angegeben'}\n"
+        f"{prio_emoji} *Priorität:* {prioritaet}\n"
+        f"📂 *Kategorie:* {kategorie}"
+        f"{termin_line}\n\n"
+        f"📝 *Beschreibung:*\n{beschreibung}"
+    )
+
+    message_id = await _send_telegram_message(tg_text)
+    if message_id and norm_phone:
+        telegram_context[str(message_id)] = {"name": kunden_name, "phone": norm_phone, "issue": titel}
+
+    return {"success": True, "ticket_id": ticket_id, "telegram_sent": message_id is not None}
 
 
 @app.post("/tools/check_calendar")
@@ -273,7 +392,7 @@ async def check_calendar(request: Request, x_api_key: Optional[str] = Header(Non
     day_names = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag"]
     while len(slots) < 8:
         if d.weekday() < 5:
-            for h in [9, 11, 14, 16]:
+            for h in [8, 10, 14, 16]:
                 slots.append({
                     "date": f"{day_names[d.weekday()]}, {d.strftime('%d.%m.%Y')}",
                     "time": f"{h:02d}:00-{h+1:02d}:00",
@@ -282,81 +401,94 @@ async def check_calendar(request: Request, x_api_key: Optional[str] = Header(Non
     return {"free_slots": slots[:6]}
 
 
+@app.post("/tools/send_telegram")
+@limiter.limit("30/minute")
+async def send_telegram(request: Request, x_api_key: Optional[str] = Header(None)):
+    check_api_key(x_api_key)
+    data = await request.json()
+    name = data.get("name") or "Nicht angegeben"
+    phone = data.get("phone") or "Nicht angegeben"
+    issue = data.get("issue") or "Nicht angegeben"
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+    text = (
+        f"📞 *Neuer Anruf bei PATEC*\n⏰ {now}\n\n"
+        f"👤 *Name:* {name}\n📱 *Rückrufnummer:* {phone}\n🔧 *Anliegen:* {issue}"
+    )
+    message_id = await _send_telegram_message(text)
+    if message_id:
+        telegram_context[str(message_id)] = {"name": name, "phone": phone, "issue": issue}
+    return {"success": message_id is not None}
+
+
+@app.post("/tools/save_ticket")
+@limiter.limit("30/minute")
+async def save_ticket(request: Request, x_api_key: Optional[str] = Header(None)):
+    check_api_key(x_api_key)
+    return {"success": True, "message": "Bitte create_ticket verwenden"}
+
+
 @app.post("/webhook/post-call")
 @limiter.limit("30/minute")
 async def post_call_webhook(request: Request):
     body = await request.body()
-
     if ELEVENLABS_WEBHOOK_SECRET:
         sig_header = request.headers.get("ElevenLabs-Signature", "")
         if not sig_header:
             raise HTTPException(status_code=403, detail="Missing ElevenLabs-Signature header")
         try:
-            parts     = dict(p.split("=", 1) for p in sig_header.split(","))
+            parts = dict(p.split("=", 1) for p in sig_header.split(","))
             timestamp = parts["t"]
-            v0_sig    = parts["v0"]
+            v0_sig = parts["v0"]
         except (KeyError, ValueError):
             raise HTTPException(status_code=403, detail="Invalid ElevenLabs-Signature format")
-
-        message  = f"{timestamp}.{body.decode()}"
+        message = f"{timestamp}.{body.decode()}"
         expected = hmac.new(
-            ELEVENLABS_WEBHOOK_SECRET.encode(),
-            message.encode(),
-            hashlib.sha256
+            ELEVENLABS_WEBHOOK_SECRET.encode(), message.encode(), hashlib.sha256
         ).hexdigest()
         if not hmac.compare_digest(expected, v0_sig):
             raise HTTPException(status_code=403, detail="Webhook signature mismatch")
 
     data = json.loads(body)
-
-    # ElevenLabs wraps the actual payload inside a "data" key
     payload = data.get("data", data)
-
-    conversation_id   = payload.get("conversation_id", "unknown")
-    log.info(f"Post-Call webhook: conversation_id={conversation_id}")
-    log.info(f"Post-Call raw keys: {list(payload.keys())}")
+    conversation_id = payload.get("conversation_id", "unknown")
+    log.info(f"Post-Call webhook: {conversation_id}")
 
     metadata = payload.get("metadata", {})
     duration = metadata.get("call_duration_secs") or payload.get("call_duration_secs", 0)
-
-    analysis          = payload.get("analysis", {})
+    analysis = payload.get("analysis", {})
     transcript_summary = analysis.get("transcript_summary") or analysis.get("summary", "")
-
     transcript = payload.get("transcript", [])
     if not transcript_summary and transcript:
         lines = [f"{m.get('role','?').capitalize()}: {m.get('message','')}" for m in transcript[:2]]
         if len(transcript) > 2:
-            lines.append("...")
             lines.append(f"{transcript[-1].get('role','?').capitalize()}: {transcript[-1].get('message','')}")
         transcript_summary = "\n".join(lines)
 
-    data_coll   = analysis.get("data_collection_results") or {}
-    caller_name  = (data_coll.get("customer_name")  or {}).get("value", "")
-    caller_phone = (data_coll.get("customer_phone") or {}).get("value", "")
-    caller_issue = (data_coll.get("issue_type")     or {}).get("value", "")
-    # Use urgency/callback from ElevenLabs data collection directly
-    urgency_str  = (data_coll.get("urgency")             or {}).get("value", "")
-    callback_str = (data_coll.get("callback_requested")  or {}).get("value", "")
+    data_coll = analysis.get("data_collection_results") or {}
+    caller_name = (data_coll.get("customer_name") or {}).get("value", "")
+    caller_phone = (data_coll.get("customer_phone") or {}).get("value", "") or metadata.get("caller_id", "")
+    caller_issue = (data_coll.get("issue_type") or {}).get("value", "")
+    urgency_str = (data_coll.get("urgency") or {}).get("value", "")
+    callback_str = (data_coll.get("callback_requested") or {}).get("value", "")
 
-    log.info(f"Post-Call data: name={caller_name!r}, phone={caller_phone!r}, issue={caller_issue!r}, duration={duration}")
-
-    # Log to Airtable (no second Telegram – agent already sent the first message during the call)
-    # Map urgency_str to Airtable priority value
     prioritaet_override = {"high": "Hoch", "medium": "Mittel", "low": "Niedrig"}.get(
         (urgency_str or "").lower(), None
     )
     rueckruf_override = (callback_str in (True, "yes", "true", "ja", "1")) if callback_str != "" else None
+    norm_phone = normalize_phone_e164(caller_phone) if caller_phone else ""
 
     asyncio.create_task(log_to_airtable({
-        "conversation_id":     conversation_id,
-        "name":                caller_name,
-        "phone":               caller_phone,
-        "anliegen":            caller_issue,
-        "summary":             transcript_summary,
-        "duration_secs":       duration,
+        "conversation_id": conversation_id,
+        "name": caller_name,
+        "phone": norm_phone,
+        "anliegen": caller_issue,
+        "summary": transcript_summary,
+        "duration_secs": duration,
         "prioritaet_override": prioritaet_override,
-        "rueckruf_override":   rueckruf_override,
+        "rueckruf_override": rueckruf_override,
     }))
+    if norm_phone:
+        asyncio.create_task(upsert_customer(norm_phone, caller_name, update_call_count=True))
 
     return {"status": "received"}
 
@@ -365,101 +497,77 @@ async def post_call_webhook(request: Request):
 @limiter.limit("30/minute")
 async def telegram_webhook(request: Request):
     update = await request.json()
-    log.info(f"Telegram update: {json.dumps(update)[:500]}")
-
     message = update.get("message", {})
     if not message:
         return {"ok": True}
-
     chat_id = str(message.get("chat", {}).get("id", ""))
     if TELEGRAM_CHAT_ID and chat_id != str(TELEGRAM_CHAT_ID):
-        log.warning(f"Ignoring message from unexpected chat_id: {chat_id}")
         return {"ok": True}
-
     reply_to = message.get("reply_to_message")
     if not reply_to:
-        # Only process replies to bot messages
         return {"ok": True}
-
     instruction = message.get("text", "").strip()
     if not instruction:
         return {"ok": True}
 
     original_message_id = str(reply_to.get("message_id", ""))
-    original_text       = reply_to.get("text", "")
-    log.info(f"Reply received: msg_id={original_message_id}, instruction={instruction!r}")
-    log.info(f"Original text: {original_text[:200]!r}")
-
-    # Try in-memory context first (available if server not redeployed since message was sent)
+    original_text = reply_to.get("text", "")
     customer = telegram_context.get(original_message_id)
-    phone    = customer["phone"] if customer else None
-    log.info(f"Context lookup: customer={customer}, phone={phone!r}")
+    phone = customer["phone"] if customer else None
 
-    # Fallback: extract phone from the original message text via regex
-    # Telegram stores the plain text without Markdown asterisks
     if not phone or phone == "Nicht angegeben":
-        # Try to match "Rueckrufnummer: +49..." (Telegram strips * formatting markers)
-        match = re.search(r"Rueckrufnummer[^:\n]*:\s*\*?\s*(\+?[\d\s\-]+)", original_text)
-        if not match:
-            # Broader fallback
-            match = re.search(r"Rueckrufnummer.*?:\s*(.+)", original_text)
+        match = re.search(r"(?:Telefon|Rückrufnummer)[^:\n]*:\s*\*?\s*(\+?[\d\s\-]+)", original_text)
         if match:
             phone = match.group(1).strip().strip("*").strip()
-            log.info(f"Regex extracted phone: {phone!r}")
 
     if not phone or phone in ("Nicht angegeben", "", "Kein"):
-        log.warning(f"Could not determine phone. original_text={original_text!r}")
-        await _send_telegram_message(
-            "\u274c Konnte Rückrufnummer nicht ermitteln.\n"
-            "Bitte manuell in der Nachricht nachschauen und direkt anrufen."
-        )
+        await _send_telegram_message("❌ Konnte Rückrufnummer nicht ermitteln.")
         return {"ok": True}
 
     customer_name = (customer or {}).get("name", "Kunde")
-    log.info(f"Triggering outbound call to {phone!r} for {customer_name!r}")
-
-    # Acknowledge receipt immediately
     await _send_telegram_message(
-        f"\U0001f4de Starte Anruf zu *{customer_name}* ({phone})\u2026\n"
-        f"\U0001f4cb Anweisung: _{instruction}_"
+        f"📞 Starte Anruf zu *{customer_name}* ({phone})…\n📋 Anweisung: _{instruction}_"
     )
-
     result = await trigger_outbound_call(phone, instruction)
-
     if result["success"]:
-        await _send_telegram_message(
-            f"\u2705 Anruf zu *{customer_name}* ({phone}) erfolgreich gestartet."
-        )
+        await _send_telegram_message(f"✅ Anruf zu *{customer_name}* ({phone}) erfolgreich gestartet.")
     else:
         reason = result.get("reason") or result.get("detail", "Unbekannter Fehler")
-        await _send_telegram_message(
-            f"\u274c Anruf zu {phone} fehlgeschlagen.\nGrund: {reason}"
-        )
-
+        await _send_telegram_message(f"❌ Anruf zu {phone} fehlgeschlagen.\nGrund: {reason}")
     return {"ok": True}
 
 
 @app.get("/calls")
 @limiter.limit("30/minute")
 async def get_calls(request: Request, x_api_key: Optional[str] = Header(None)):
-    """Gibt die letzten Anrufe aus Airtable zurueck."""
     check_api_key(x_api_key)
-    if not AIRTABLE_API_KEY or not AIRTABLE_BASE_ID:
-        raise HTTPException(status_code=503, detail="Airtable nicht konfiguriert")
-
-    table_encoded = quote(AIRTABLE_TABLE_NAME, safe="")
-    url = (
-        f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table_encoded}"
-        f"?sort[0][field]=Datum&sort[0][direction]=desc&maxRecords=50"
-    )
-    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+    url = f"{_airtable_url(AIRTABLE_TABLE_CALLS)}?sort[0][field]=Datum&sort[0][direction]=desc&maxRecords=50"
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=headers)
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    data    = resp.json()
-    records = [{"id": r["id"], **r["fields"]} for r in data.get("records", [])]
-    return {"total": len(records), "calls": records}
+        resp = await client.get(url, headers=_airtable_headers())
+        data = resp.json()
+        return {"total": len(data.get("records", [])), "calls": [{"id": r["id"], **r["fields"]} for r in data.get("records", [])]}
+
+
+@app.get("/tickets")
+@limiter.limit("30/minute")
+async def get_tickets_endpoint(request: Request, x_api_key: Optional[str] = Header(None)):
+    check_api_key(x_api_key)
+    url = f"{_airtable_url(AIRTABLE_TABLE_TICKETS)}?sort[0][field]=Erstellt am&sort[0][direction]=desc&maxRecords=50"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, headers=_airtable_headers())
+        data = resp.json()
+        return {"total": len(data.get("records", [])), "tickets": [{"id": r["id"], **r["fields"]} for r in data.get("records", [])]}
+
+
+@app.get("/customers")
+@limiter.limit("30/minute")
+async def get_customers(request: Request, x_api_key: Optional[str] = Header(None)):
+    check_api_key(x_api_key)
+    url = f"{_airtable_url(AIRTABLE_TABLE_CUSTOMERS)}?sort[0][field]=Letzter Anruf&sort[0][direction]=desc&maxRecords=100"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, headers=_airtable_headers())
+        data = resp.json()
+        return {"total": len(data.get("records", [])), "customers": [{"id": r["id"], **r["fields"]} for r in data.get("records", [])]}
 
 
 @app.get("/setup/telegram-webhook")
@@ -472,16 +580,24 @@ async def setup_telegram_webhook(request: Request, x_api_key: Optional[str] = He
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
             json={"url": webhook_url},
         )
-    data = resp.json()
-    log.info(f"setWebhook: {data}")
-    return {"webhook_url": webhook_url, "telegram_response": data}
+    return {"webhook_url": webhook_url, "telegram_response": resp.json()}
 
 
-@app.get("/tickets")
-@limiter.limit("30/minute")
-async def get_tickets(request: Request, x_api_key: Optional[str] = Header(None)):
+@app.get("/setup/telegram-test")
+@limiter.limit("5/minute")
+async def test_telegram(request: Request, x_api_key: Optional[str] = Header(None)):
     check_api_key(x_api_key)
-    return tickets
+    async with httpx.AsyncClient(timeout=10) as client:
+        bot_resp = await client.get(f"https://api.telegram.org/bot{TELEBRAM_BOT_TOKEN}/getMe")
+        webhook_resp = await client.get(f"https://api.telegram.org/bot{TELEBRAM_BOT_TOKEN}/getWebhookInfo")
+    msg_id = await _send_telegram_message("🔔 PATEC Test-Nachricht — Telegram funktioniert! ✅")
+    return {
+        "token_configured": bool(TELEGRAM_BOT_TOKEN),
+        "chat_id": TELEGRAM_CHAT_ID,
+        "bot_info": bot_resp.json(),
+        "webhook_info": webhook_resp.json(),
+        "test_message_sent": msg_id is not None,
+    }
 
 
 if __name__ == "__main__":
