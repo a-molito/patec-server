@@ -36,6 +36,7 @@ AIRTABLE_TABLE_CUSTOMERS = "👥 Kunden"
 AIRTABLE_TABLE_TICKETS = "🎫 Tickets"
 
 telegram_context: dict = {}
+outbound_conversations: set = set()  # Speichert Conversation-IDs ausgehender Anrufe
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["30/minute"])
 app = FastAPI(title="PATEC Telefonagent API v3")
@@ -210,6 +211,7 @@ async def log_to_airtable(call_data: dict):
         "Status": "Neu",
         "Prioritaet": prioritaet,
         "Rueckruf erforderlich": rueckruf,
+        "Anruftyp": call_data.get("anruftyp", "eingehend"),
         "Notizen": call_data.get("notizen", ""),
     }
     return await _airtable_create(AIRTABLE_TABLE_CALLS, fields)
@@ -226,7 +228,12 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
         "agent_phone_number_id": ELEVENLABS_PHONE_NUMBER_ID,
         "to_number": phone,
         "conversation_initiation_client_data": {
-            "dynamic_variables": {"owner_instruction": instruction}
+            "dynamic_variables": {"owner_instruction": instruction},
+            "conversation_config_override": {
+                "agent": {
+                    "first_message": instruction
+                }
+            }
         },
     }
     try:
@@ -242,6 +249,9 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
                     body = resp.json()
                     if body.get("success") is False:
                         return {"success": False, "reason": body.get("message", "Unbekannter Fehler")}
+                    conv_id = body.get("conversation_id", "") or body.get("callSid", "")
+                    if conv_id:
+                        outbound_conversations.add(conv_id)
                     return {"success": True, "data": body}
                 except Exception:
                     return {"success": True, "data": {}}
@@ -466,7 +476,11 @@ async def post_call_webhook(request: Request):
 
     data_coll = analysis.get("data_collection_results") or {}
     caller_name = (data_coll.get("customer_name") or {}).get("value", "")
-    caller_phone = (data_coll.get("customer_phone") or {}).get("value", "") or metadata.get("caller_id", "")
+    caller_phone = (
+        (data_coll.get("customer_phone") or {}).get("value", "") or
+        payload.get("caller_id", "") or
+        metadata.get("caller_id", "")
+    )
     caller_issue = (data_coll.get("issue_type") or {}).get("value", "")
     urgency_str = (data_coll.get("urgency") or {}).get("value", "")
     callback_str = (data_coll.get("callback_requested") or {}).get("value", "")
@@ -477,6 +491,8 @@ async def post_call_webhook(request: Request):
     rueckruf_override = (callback_str in (True, "yes", "true", "ja", "1")) if callback_str != "" else None
     norm_phone = normalize_phone_e164(caller_phone) if caller_phone else ""
 
+    anruftyp = "ausgehend" if conversation_id in outbound_conversations else "eingehend"
+    outbound_conversations.discard(conversation_id)
     asyncio.create_task(log_to_airtable({
         "conversation_id": conversation_id,
         "name": caller_name,
@@ -486,6 +502,7 @@ async def post_call_webhook(request: Request):
         "duration_secs": duration,
         "prioritaet_override": prioritaet_override,
         "rueckruf_override": rueckruf_override,
+        "anruftyp": anruftyp,
     }))
     if norm_phone:
         asyncio.create_task(upsert_customer(norm_phone, caller_name, update_call_count=True))
