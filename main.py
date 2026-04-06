@@ -282,7 +282,24 @@ async def lookup_customer(request: Request, x_api_key: Optional[str] = Header(No
     """Sucht Kunden anhand der Telefonnummer. Gibt Kundeninfo + letzte Anrufe zurueck."""
     check_api_key(x_api_key)
     data = await request.json()
-    phone_raw = data.get("phone", "").strip()
+    # Support both old "phone" field and new caller_id/called_number pair
+    caller_id_raw = data.get("caller_id", data.get("phone", "")).strip()
+    called_number_raw = data.get("called_number", "").strip()
+
+    # Determine which number belongs to the CUSTOMER
+    # For inbound: caller_id = customer, called_number = PATEC
+    # For outbound: caller_id = PATEC, called_number = customer
+    PATEC_NUMBERS = ("+498941432021", "+4989414")
+    def is_patec_number(n):
+        return any(n.startswith(p) for p in PATEC_NUMBERS)
+
+    if caller_id_raw and not is_patec_number(normalize_phone_e164(caller_id_raw)):
+        phone_raw = caller_id_raw
+    elif called_number_raw and not is_patec_number(normalize_phone_e164(called_number_raw)):
+        phone_raw = called_number_raw
+    else:
+        phone_raw = caller_id_raw  # fallback
+
     if not phone_raw:
         return {"found": False, "error": "Keine Telefonnummer angegeben"}
 
@@ -338,6 +355,15 @@ async def create_ticket(request: Request, x_api_key: Optional[str] = Header(None
     prioritaet = data.get("prioritaet") or _detect_priority(f"{titel} {beschreibung}")
     kunden_name = data.get("kunden_name", "Unbekannt")
     kunden_telefon = data.get("kunden_telefon", "")
+    # Fallback: use caller_id/called_number if kunden_telefon not provided
+    if not kunden_telefon:
+        _ci = data.get("caller_id", "")
+        _cn = data.get("called_number", "")
+        _patec = "+498941432021"
+        if _ci and normalize_phone_e164(_ci) != _patec:
+            kunden_telefon = _ci
+        elif _cn and normalize_phone_e164(_cn) != _patec:
+            kunden_telefon = _cn
     gewuenschter_termin = data.get("gewuenschter_termin", "")
     anruf_id = data.get("anruf_id", "")
     zustaendig = data.get("zustaendig", "Aki Paleopanis")
@@ -533,9 +559,9 @@ async def telegram_webhook(request: Request):
     phone = customer["phone"] if customer else None
 
     if not phone or phone == "Nicht angegeben":
-        match = re.search(r"(?:Telefon|Rückrufnummer)[^:\n]*:\s*\*?\s*(\+?[\d\s\-]+)", original_text)
+        match = re.search(r"(?:Telefon|Rückrufnummer|Tel\.?|Nummer)[^:\n]*:\s*\*?\s*(\+?[\d\s\-\/]+)", original_text)
         if match:
-            phone = match.group(1).strip().strip("*").strip()
+            phone = re.sub(r"[\s\-\/]", "", match.group(1).strip().strip("*").strip())
 
     if not phone or phone in ("Nicht angegeben", "", "Kein"):
         await _send_telegram_message("❌ Konnte Rückrufnummer nicht ermitteln.")
