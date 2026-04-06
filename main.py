@@ -9,7 +9,7 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote
-from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi import FastAPI, Request, Header, HTTPExcepion
 from starlette.middleware.base import BaseHTTPMiddleware
 import httpx
 from dotenv import load_dotenv
@@ -231,7 +231,7 @@ async def trigger_outbound_call(phone: str, instruction: str) -> dict:
             "dynamic_variables": {"owner_instruction": instruction},
             "conversation_config_override": {
                 "agent": {
-                    "first_message": f"Guten Tag, hier ist der Telefonassistent von PATEC. Wir melden uns bezüglich Ihres Anliegens: {instruction[:120]}."
+                    "first_message": "Guten Tag, hier ist der Telefonassistent von PATEC. Schön, dass ich Sie erreiche. Haben Sie kurz einen Moment?"
                 }
             }
         },
